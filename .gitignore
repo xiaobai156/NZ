@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage*
+*.egg-info/
+
+# PyInstaller / build outputs
+build/
+dist/
+work/build*/
+work/dist*/
+work/*_build/
+work/*_dist/
+work/pyinstaller_current/
+work/cpu_build/
+work/cpu_dist/
+work/gpu_build/
+work/gpu_dist/
+work/diag_build*/
+work/diag_dist*/
+work/final_build*/
+work/final_stage*/
+work/release_*/
+
+# Executables
+*.exe
+*.dll
+*.pyd
+
+# Runtime data and results
+结果/
+outputs/运行日志/
+outputs/抓取状态/
+outputs/群配置/
+
+# Diagnostic artifacts
+work/*_probe*.json
+work/ocr_*.json
+*.log
