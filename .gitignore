@@ -33,7 +33,6 @@ work/release_*/
 结果/
 outputs/运行日志/
 outputs/抓取状态/
-outputs/群配置/
 
 # Diagnostic artifacts
 work/*_probe*.json
