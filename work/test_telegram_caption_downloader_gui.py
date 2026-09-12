@@ -43,6 +43,7 @@ from telegram_caption_downloader_gui import (
     today_result_exists,
     save_group_profile,
     save_saved_credentials,
+    save_session_string,
     split_chat_addresses,
     STATUS_OUTPUT_DIR,
     validate_group_name,
@@ -53,12 +54,29 @@ from telegram_caption_downloader_gui import (
     load_account_profiles,
     create_account_profile,
     verify_account_user,
+    load_account_session,
+    load_session_string,
+    session_blob_path,
+    resolve_private_chat,
     DOWNLOAD_CONCURRENCY,
     HUANGDAXIAN_ADJACENT_LABELS,
     HUANGDAXIAN_OCR_LABELS,
     YANRAN_ADJACENT_LABELS,
     YANRAN_FIRST_IMAGE_OCR_LABELS,
+    XINAO_EXPERT_UNWANTED_MARKERS,
+    compact_text,
+    collect_label_group_messages,
+    filter_unwanted_ocr_groups,
 )
+
+
+def fake_session_string(seed: int = 0) -> str:
+    from telethon.crypto import AuthKey
+    from telethon.sessions import StringSession
+    session = StringSession()
+    session.set_dc(2, "149.154.167.51", 443)
+    session.auth_key = AuthKey(bytes((seed + index) % 256 for index in range(256)))
+    return session.save()
 
 
 class CoreLogicTests(unittest.TestCase):
@@ -101,10 +119,10 @@ class CoreLogicTests(unittest.TestCase):
             {"天机阁特围", "天机阁杀料"},
         )
 
-    def test_enping_checks_both_immediate_neighbors_with_existing_similarity_rule(self):
+    def test_enping_extends_two_groups_in_both_directions(self):
         messages = [
             SimpleNamespace(id=index, raw_text="恩平" if index == 3 else "", grouped_id=index)
-            for index in range(1, 6)
+            for index in range(1, 7)
         ]
         labels = YANRAN_ADJACENT_LABELS.intersection({"恩平"})
         checked = []
@@ -114,8 +132,8 @@ class CoreLogicTests(unittest.TestCase):
             similarity_labels=labels - YANRAN_FIRST_IMAGE_OCR_LABELS,
             group_similarity=lambda anchor, candidate: checked.append(candidate[0].id) or True,
         )
-        self.assertEqual(set(checked), {2, 4})
-        self.assertEqual(selected, {2: {"恩平"}, 3: {"恩平"}, 4: {"恩平"}})
+        self.assertEqual(set(checked), {1, 2, 4, 5})
+        self.assertEqual(selected, {index: {"恩平"} for index in range(1, 6)})
 
     def test_tianji_adjacent_labels_can_skip_visual_similarity(self):
         messages = [
@@ -297,6 +315,106 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual((root / "account.session").read_bytes(), b"original session")
             self.assertFalse((root / "accounts.json").exists())
 
+    def test_legacy_sqlite_session_is_migrated_to_encrypted_string(self):
+        from telethon.crypto import AuthKey
+        from telethon.sessions import SQLiteSession, StringSession
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = account_directory(root, "legacy") / "account"
+            old = SQLiteSession(str(session))
+            old.set_dc(2, "149.154.167.51", 443)
+            old.auth_key = AuthKey(bytes(range(256)))
+            expected = StringSession.save(old)
+            old.close()
+            migrated = load_account_session(session, lambda _text: None)
+            self.assertEqual(migrated.save(), expected)
+            self.assertEqual(load_session_string(session_blob_path(root)), expected)
+            self.assertTrue((root / "account.session").is_file())
+
+    def test_private_group_settings_roundtrip_and_clear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = load_group_settings(root)
+            save_group_profile(root, settings, "", "私密群", "",
+                               chat_id=-1004401898428, bound_account_id="legacy")
+            reloaded = load_group_settings(root)
+            self.assertEqual(reloaded["groups"], [{
+                "name": "私密群",
+                "address": "",
+                "start_time": "00:00",
+                "end_time": "23:59",
+                "chat_id": -1004401898428,
+                "bound_account_id": "legacy",
+            }])
+            save_group_profile(root, reloaded, "私密群", "公开群", "https://t.me/example")
+            again = load_group_settings(root)
+            self.assertEqual(again["groups"], [{
+                "name": "公开群",
+                "address": "https://t.me/example",
+                "start_time": "00:00",
+                "end_time": "23:59",
+            }])
+            with self.assertRaises(ValueError):
+                save_group_profile(root, again, "", "私密二", "", chat_id=-1001)
+            with self.assertRaises(ValueError):
+                save_group_profile(root, again, "", "私密三", "", chat_id=1001, bound_account_id="legacy")
+
+    def test_resolve_private_chat_uses_cache_then_dialogs(self):
+        from telethon import utils
+        from telethon.tl.types import InputPeerChannel
+        chat_id = -1004401898428
+        peer = InputPeerChannel(channel_id=4401898428, access_hash=7)
+        self.assertEqual(utils.get_peer_id(peer), chat_id)
+
+        class CachedClient:
+            def __init__(self):
+                self.requested = None
+                self.dialogs_scanned = False
+
+            def get_input_entity(self, value):
+                self.requested = value
+                return peer
+
+            def iter_dialogs(self):
+                self.dialogs_scanned = True
+                return iter(())
+
+        client = CachedClient()
+        self.assertIs(resolve_private_chat(client, chat_id), peer)
+        self.assertEqual(client.requested, chat_id)
+        self.assertFalse(client.dialogs_scanned)
+
+        class Dialog:
+            id = chat_id
+            input_entity = peer
+
+        class FallbackClient:
+            def get_input_entity(self, value):
+                raise ValueError("not cached")
+
+            def iter_dialogs(self):
+                return iter([Dialog()])
+
+        self.assertIs(resolve_private_chat(FallbackClient(), chat_id), peer)
+
+        class MissingClient(FallbackClient):
+            def iter_dialogs(self):
+                return iter(())
+
+        with self.assertRaisesRegex(ValueError, "无法定位"):
+            resolve_private_chat(MissingClient(), chat_id)
+
+    def test_muxi_exact_labels_require_full_match(self):
+        from telegram_caption_downloader_gui import MUXI_EXACT_LABELS, caption_matches_keyword
+        self.assertEqual(MUXI_EXACT_LABELS, {"九肖", "绝杀合数", "帅铁精杀", "四头中特24码中特", "大围"})
+        self.assertTrue(caption_matches_keyword("九肖", "九肖", True))
+        self.assertTrue(caption_matches_keyword("  九 肖  ", "九肖", True))
+        self.assertFalse(caption_matches_keyword("九肖统计", "九肖", True))
+        self.assertFalse(caption_matches_keyword("单挑一肖", "九肖", True))
+        self.assertTrue(caption_matches_keyword("九肖统计", "九肖统计", False))
+        self.assertTrue(caption_matches_keyword("四头中特 24码中特", "四头中特24码中特", True))
+        self.assertFalse(caption_matches_keyword("四头中特24码中特加", "四头中特24码中特", True))
+
     def test_accounts_use_separate_sessions_and_encrypted_credentials_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -357,6 +475,81 @@ class CoreLogicTests(unittest.TestCase):
         events = []
         self.assertEqual(ocr_labels_from_payload(b"bad image", {"战狼"}, object(), on_error=events.append), set())
         self.assertEqual(events, ["UnidentifiedImageError"])
+
+    def test_unwanted_marker_matching_ignores_punctuation_and_spaces(self):
+        class FakeOCR:
+            def predict(self, image):
+                return [{"rec_texts": ["255期： 「小数」 + 「双数」 开：", "实力 双波"]}]
+
+        payload = io.BytesIO()
+        Image.new("RGB", (4, 4), (255, 255, 255)).save(payload, format="PNG")
+        self.assertEqual(
+            ocr_labels_from_payload(
+                payload.getvalue(),
+                {"小数+双数", "实力双波", "天地中特"},
+                FakeOCR(),
+                cleanup=compact_text,
+            ),
+            {"小数+双数", "实力双波"},
+        )
+
+    def test_filter_unwanted_ocr_groups_drops_marker_group_and_keeps_other(self):
+        messages = [
+            SimpleNamespace(id=1, raw_text="斩杀系列", grouped_id=10),
+            SimpleNamespace(id=2, raw_text="", grouped_id=10),
+            SimpleNamespace(id=3, raw_text="斩杀系列", grouped_id=20),
+            SimpleNamespace(id=4, raw_text="", grouped_id=20),
+        ]
+        selection = {message.id: {"斩杀系列"} for message in messages}
+        payloads = {1: b"unwanted", 2: b"unwanted-second", 3: b"wanted", 4: b"wanted-second"}
+        calls = []
+
+        def fake_ocr(payload, labels, _engine, on_error=None, cleanup=None):
+            calls.append(payload)
+            return {"实力双波"} if payload == b"unwanted" else set()
+
+        with patch("telegram_caption_downloader_gui.ocr_labels_from_payload", side_effect=fake_ocr):
+            filtered, ignored = filter_unwanted_ocr_groups(
+                messages,
+                selection,
+                {"斩杀系列"},
+                payloads,
+                XINAO_EXPERT_UNWANTED_MARKERS,
+                ocr_engine=object(),
+            )
+        self.assertEqual(filtered, {3: {"斩杀系列"}, 4: {"斩杀系列"}})
+        self.assertEqual(ignored, {"斩杀系列": {1, 2}})
+        self.assertEqual(calls, [b"unwanted", b"wanted", b"wanted-second"])
+
+    def test_filter_unwanted_ocr_groups_keeps_all_without_marker_hits(self):
+        messages = [SimpleNamespace(id=1, raw_text="斩杀系列", grouped_id=10)]
+        with patch("telegram_caption_downloader_gui.ocr_labels_from_payload", return_value=set()):
+            filtered, ignored = filter_unwanted_ocr_groups(
+                messages,
+                {1: {"斩杀系列"}},
+                {"斩杀系列"},
+                {1: b"payload"},
+                XINAO_EXPERT_UNWANTED_MARKERS,
+                ocr_engine=object(),
+            )
+        self.assertEqual(filtered, {1: {"斩杀系列"}})
+        self.assertEqual(ignored, {})
+
+    def test_collect_label_group_messages_returns_whole_matching_groups(self):
+        messages = [
+            SimpleNamespace(id=1, grouped_id=10),
+            SimpleNamespace(id=2, grouped_id=10),
+            SimpleNamespace(id=3, grouped_id=20),
+            SimpleNamespace(id=4, grouped_id=30),
+        ]
+        self.assertEqual(
+            collect_label_group_messages(messages, {1: {"斩杀系列"}}, {"斩杀系列"}),
+            {1, 2},
+        )
+        self.assertEqual(
+            collect_label_group_messages(messages, {3: {"其他"}}, {"斩杀系列"}),
+            set(),
+        )
 
     def test_telegram_internal_logs_are_filtered_isolated_and_detached(self):
         events = []
@@ -653,7 +846,7 @@ class CoreLogicTests(unittest.TestCase):
             {message.id: {"天机阁杀料"} for message in messages},
         )
 
-    def test_乖乖团队_only_checks_the_immediate_next_group_when_similar(self):
+    def test_乖乖团队_extends_two_similar_groups_and_stops_at_two(self):
         notes = {"乖乖团队": "乖乖团队"}
         messages = [
             SimpleNamespace(id=1, raw_text="乖乖团队", grouped_id=10, visual_type="blue"),
@@ -661,16 +854,24 @@ class CoreLogicTests(unittest.TestCase):
             SimpleNamespace(id=3, raw_text="", grouped_id=20, visual_type="blue"),
             SimpleNamespace(id=4, raw_text="", grouped_id=20, visual_type="blue"),
             SimpleNamespace(id=5, raw_text="", grouped_id=30, visual_type="blue"),
+            SimpleNamespace(id=6, raw_text="", grouped_id=40, visual_type="blue"),
         ]
+        compared = []
+
+        def similarity(anchor, candidate):
+            compared.append((anchor[0].id, candidate[0].id))
+            return anchor[0].visual_type == candidate[0].visual_type
+
         self.assertEqual(
             build_download_selection(
                 messages,
                 notes,
                 special_adjacent_labels={"乖乖团队"},
-                group_similarity=lambda anchor, candidate: anchor[0].visual_type == candidate[0].visual_type,
+                group_similarity=similarity,
             ),
-            {1: {"乖乖团队"}, 2: {"乖乖团队"}, 3: {"乖乖团队"}, 4: {"乖乖团队"}},
+            {1: {"乖乖团队"}, 2: {"乖乖团队"}, 3: {"乖乖团队"}, 4: {"乖乖团队"}, 5: {"乖乖团队"}},
         )
+        self.assertEqual(compared, [(1, 3), (3, 5)])
 
     def test_乖乖团队_does_not_classify_a_different_immediate_group_or_the_following_group(self):
         notes = {"乖乖团队": "乖乖团队"}
@@ -695,7 +896,7 @@ class CoreLogicTests(unittest.TestCase):
         messages = [
             SimpleNamespace(id=1, raw_text="乖乖团队", grouped_id=10, visual_type="blue"),
             SimpleNamespace(id=2, raw_text="", grouped_id=20, visual_type="blue"),
-            SimpleNamespace(id=3, raw_text="", grouped_id=30, visual_type="blue"),
+            SimpleNamespace(id=3, raw_text="", grouped_id=30, visual_type="red"),
             SimpleNamespace(id=4, raw_text="乖乖团队", grouped_id=40, visual_type="blue"),
         ]
         self.assertEqual(
@@ -703,7 +904,7 @@ class CoreLogicTests(unittest.TestCase):
                 messages,
                 notes,
                 special_adjacent_labels={"乖乖团队"},
-                group_similarity=lambda anchor, candidate: True,
+                group_similarity=lambda anchor, candidate: anchor[0].visual_type == candidate[0].visual_type,
             ),
             {1: {"乖乖团队"}, 2: {"乖乖团队"}, 4: {"乖乖团队"}},
         )
@@ -798,6 +999,18 @@ class CoreLogicTests(unittest.TestCase):
                 {"战狼", "红人馆"},
             ),
             {1, 2, 3, 4, 5, 6, 7},
+        )
+
+    def test_visual_preview_collection_covers_two_groups_on_each_side(self):
+        messages = [SimpleNamespace(id=index, grouped_id=index * 10) for index in range(1, 8)]
+        self.assertEqual(
+            collect_adjacent_preview_messages(
+                messages,
+                {4: {"乖乖团队"}},
+                {"乖乖团队"},
+                {"乖乖团队"},
+            ),
+            {2, 3, 4, 5, 6},
         )
 
     def test_ocr_matches_special_label_from_any_recognized_text(self):
@@ -1411,6 +1624,7 @@ class GuiFlowTests(unittest.TestCase):
 
     def test_restart_uses_last_manually_selected_account_without_chooser(self):
         from unittest.mock import MagicMock
+        from telethon.sessions import StringSession
         from telegram_caption_downloader_gui import load_selected_account
         app_data = Path(self.app_directory.name)
         second = create_account_profile(app_data, "备用号", 678, "other-secret", "+8613900000000")
@@ -1418,8 +1632,9 @@ class GuiFlowTests(unittest.TestCase):
         for account_id, user_id, phone in [("legacy", 7, "8613800000000"),
                                            (second["id"], 8, "8613900000000")]:
             self.app.select_account(account_id)
-            session = account_directory(app_data, account_id) / "account.session"
-            session.write_bytes(b"test session retained")
+            session = account_directory(app_data, account_id) / "session.bin"
+            save_session_string(session, fake_session_string())
+            original_session = session.read_bytes()
             for _ in range(2):
                 root = Tk()
                 client = MagicMock()
@@ -1437,11 +1652,11 @@ class GuiFlowTests(unittest.TestCase):
                         self.assertTrue(app.logged_in)
                         self.assertEqual(app.active_account_id, account_id)
                         self.assertFalse(hasattr(app, "login_settings_window"))
-                        self.assertEqual(factory.call_args.args[0], str(session.with_suffix("")))
+                        self.assertIsInstance(factory.call_args.args[0], StringSession)
                         info.assert_not_called()
                         client.send_code_request.assert_not_called()
                     self.assertEqual(load_selected_account(app_data), account_id)
-                    self.assertEqual(session.read_bytes(), b"test session retained")
+                    self.assertEqual(session.read_bytes(), original_session)
                     self.assertEqual(app.status_root, self.app.status_root)
                     self.assertEqual(app.settings, self.app.settings)
                 finally:
@@ -1451,7 +1666,9 @@ class GuiFlowTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from telegram_caption_downloader_gui import load_selected_account
         root = Path(self.app_directory.name)
-        (root / "account.session").write_bytes(b"test expired session")
+        session = root / "session.bin"
+        save_session_string(session, fake_session_string())
+        original_session = session.read_bytes()
         client = MagicMock()
         client.is_user_authorized.return_value = False
         self.app.run_worker = lambda operation, success: success(operation())
@@ -1463,7 +1680,7 @@ class GuiFlowTests(unittest.TestCase):
         self.assertFalse(self.app.logged_in)
         self.assertEqual(self.app.selected_account_id, "legacy")
         self.assertEqual(load_selected_account(root), "legacy")
-        self.assertEqual((root / "account.session").read_bytes(), b"test expired session")
+        self.assertEqual(session.read_bytes(), original_session)
 
     def test_invalid_saved_choice_prompts_without_fallback_or_overwrite(self):
         self.app.select_account("")
@@ -1564,6 +1781,7 @@ class GuiFlowTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from telegram_caption_downloader_gui import load_selected_account
         from telethon.errors import SessionPasswordNeededError
+        from telethon.sessions import StringSession
         root = Path(self.app_directory.name)
         old_credentials = (root / "credentials.bin").read_bytes()
         (root / "account.session").write_bytes(b"old session, must not move")
@@ -1589,7 +1807,7 @@ class GuiFlowTests(unittest.TestCase):
         self.assertEqual(load_selected_account(root), new_id)
         self.assertTrue(self.app.logged_in)
         self.assertNotEqual(new_id, "legacy")
-        self.assertEqual(factory.call_args.args[0], str(account_directory(root, new_id) / "account"))
+        self.assertIsInstance(factory.call_args.args[0], StringSession)
         self.assertEqual(ask.call_count, 2)
         client.send_code_request.assert_called_once_with("+8613900000000")
         client.sign_in.assert_any_call(password="secret-password")
@@ -1636,6 +1854,9 @@ class GuiFlowTests(unittest.TestCase):
         self.app.output_path.set(str(root / "results"))
         self.app.day.set("2026-09-02")
         sessions = []
+        first_session, second_session = fake_session_string(1), fake_session_string(2)
+        save_session_string(account_directory(root, "legacy") / "session.bin", first_session)
+        save_session_string(account_directory(root, second["id"]) / "session.bin", second_session)
 
         class Message:
             id, raw_text, grouped_id = 1, "资料", None
@@ -1681,13 +1902,214 @@ class GuiFlowTests(unittest.TestCase):
             self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, second["id"], 8
             Client.identity = SimpleNamespace(id=8, phone="8613900000000")
             self.app.start_download(retry=True)
-        self.assertEqual(sessions, [str(root / "account"), str(account_directory(root, second["id"]) / "account")])
+        self.assertEqual([session.save() for session in sessions], [first_session, second_session])
         self.assertEqual(load_capture_status(status_path)["first_capture_time"], original_status["first_capture_time"])
         self.assertEqual(load_capture_status(status_path)["remarks"], original_status["remarks"])
         self.assertEqual(len(list((root / "results").rglob("*.jpg"))), 1)
         self.assertEqual(len(list(self.app.status_root.glob("*.json"))), 1)
         self.assertTrue((self.app.log_root / "共享群").is_dir())
         self.assertFalse((self.app.log_root / second["id"]).exists())
+
+    def test_private_group_uses_bound_account_session_without_switching_current_login(self):
+        from telethon.tl.types import InputPeerChannel
+        root = Path(self.app_directory.name)
+        second = create_account_profile(root, "备用号", 678, "other-secret", "+8613900000000")
+        second_session = fake_session_string(3)
+        save_saved_credentials(account_directory(root, second["id"]) / "credentials.bin",
+                               678, "other-secret", "+8613900000000")
+        save_session_string(account_directory(root, second["id"]) / "session.bin", second_session)
+        save_group_profile(self.app.program_root, self.app.settings, "", "慕熙会员群", "",
+                           chat_id=-1004401898428, bound_account_id=second["id"])
+        self.app.refresh_account_profiles()
+        self.app.reload_group_profiles("慕熙会员群")
+        self.app.day.set("2026-09-02")
+        self.app.output_path.set(str(root / "results"))
+        sessions = []
+
+        class Client:
+            def __init__(self, session, *_args, **_kwargs):
+                sessions.append(session)
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=8, phone="8613900000000")
+
+            def get_input_entity(self, _value):
+                return InputPeerChannel(channel_id=4401898428, access_hash=7)
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter(())
+
+        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
+            self.app.start_download()
+        self.assertEqual([session.save() for session in sessions], [second_session])
+        self.assertTrue(self.app.logged_in)
+        self.assertEqual(self.app.active_account_id, "legacy")
+        logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
+        self.assertIn("本次私密群抓取使用", logs)
+        self.assertIn("-1004401898428", logs)
+
+    def test_private_group_missing_bound_session_stops_without_switching(self):
+        root = Path(self.app_directory.name)
+        second = create_account_profile(root, "备用号", 678, "other-secret", "+8613900000000")
+        save_group_profile(self.app.program_root, self.app.settings, "", "慕熙会员群", "",
+                           chat_id=-1004401898428, bound_account_id=second["id"])
+        self.app.refresh_account_profiles()
+        self.app.reload_group_profiles("慕熙会员群")
+        self.app.day.set("2026-09-02")
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with patch("telethon.sync.TelegramClient") as factory, \
+             patch("telegram_caption_downloader_gui.messagebox.showwarning") as warning:
+            self.app.start_download()
+        factory.assert_not_called()
+        warning.assert_called_once()
+        self.assertTrue(self.app.logged_in)
+        self.assertEqual(self.app.active_account_id, "legacy")
+
+    def test_private_group_expired_bound_session_does_not_clear_current_login(self):
+        root = Path(self.app_directory.name)
+        second = create_account_profile(root, "备用号", 678, "other-secret", "+8613900000000")
+        save_saved_credentials(account_directory(root, second["id"]) / "credentials.bin",
+                               678, "other-secret", "+8613900000000")
+        save_session_string(account_directory(root, second["id"]) / "session.bin", fake_session_string(4))
+        save_group_profile(self.app.program_root, self.app.settings, "", "慕熙会员群", "",
+                           chat_id=-1004401898428, bound_account_id=second["id"])
+        self.app.refresh_account_profiles()
+        self.app.reload_group_profiles("慕熙会员群")
+        self.app.day.set("2026-09-02")
+
+        class ExpiredClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return False
+
+        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with patch("telethon.sync.TelegramClient", ExpiredClient), \
+             patch("telegram_caption_downloader_gui.messagebox.showinfo"):
+            with self.assertRaisesRegex(RuntimeError, "登录已失效"):
+                self.app.start_download()
+        self.assertTrue(self.app.logged_in)
+        self.assertEqual(self.app.active_account_id, "legacy")
+
+    def test_public_group_still_requires_current_account_login(self):
+        save_group_profile(self.app.program_root, self.app.settings, "", "公开测试群", "@public")
+        self.app.reload_group_profiles("公开测试群")
+        self.app.logged_in, self.app.active_account_id = False, ""
+        with patch("telethon.sync.TelegramClient") as factory, \
+             patch("telegram_caption_downloader_gui.messagebox.showwarning") as warning:
+            self.app.start_download()
+        factory.assert_not_called()
+        warning.assert_called_once()
+
+    def test_group_settings_dialog_saves_and_reloads_private_group(self):
+        root = Path(self.app_directory.name)
+        second = create_account_profile(root, "备用号", 678, "other-secret", "+8613900000000")
+        self.app.refresh_account_profiles()
+        dialog = GroupSettingsDialog(self.app)
+        try:
+            dialog.new_item()
+            dialog.name.set("慕熙会员群")
+            dialog.chat_id.set("-1004401898428")
+            dialog.bound_account_combo.current(1)
+            dialog.bound_account.set(dialog.bound_account_combo.get())
+            dialog.save_item()
+            profile = next(item for item in self.app.settings["groups"] if item["name"] == "慕熙会员群")
+            self.assertEqual(profile["chat_id"], -1004401898428)
+            self.assertEqual(profile["bound_account_id"], second["id"])
+            self.assertEqual(profile["address"], "")
+
+            dialog.tree.selection_set(dialog.tree.get_children()[-1])
+            dialog.select_item()
+            self.assertEqual(dialog.chat_id.get(), "-1004401898428")
+            self.assertEqual(dialog.selected_bound_account_id(), second["id"])
+            self.assertEqual(str(dialog.address_entry.cget("state")), "disabled")
+        finally:
+            dialog.window.destroy()
+
+    def test_retry_incremental_new_source_stops_at_day_start(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "测试群", "@old | @new")
+        self.app.reload_group_profiles("测试群")
+        notes_file = self.app.program_root / "群配置" / "测试群.json"
+        notes_file.write_text('{"keywords":["九肖统计"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        (root / "results" / "9.2-测试群").mkdir(parents=True)
+        status_path = capture_status_path(self.app.status_root, "测试群")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(json.dumps({
+            "group_name": "测试群",
+            "date": "2026-09-02",
+            "remarks": {"九肖统计": {"status": "待处理", "pending_message_ids": [3]}},
+            "last_message_ids": {"@old": 5},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        consumed = []
+        in_day = SimpleNamespace(id=10, raw_text="九肖统计", grouped_id=None,
+                                 date=datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc),
+                                 file=None, photo=False)
+        older = SimpleNamespace(id=1, raw_text="", grouped_id=None,
+                                date=datetime(2026, 8, 1, 4, 0, tzinfo=timezone.utc),
+                                file=None, photo=False)
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def get_messages(self, *_args, **_kwargs):
+                return []
+
+            def iter_messages(self, _entity, **_kwargs):
+                def stream():
+                    consumed.append(10)
+                    yield in_day
+                    consumed.append(1)
+                    yield older
+                    raise AssertionError("增量扫描未在当天开始处停止")
+
+                return stream()
+
+        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with patch("telethon.sync.TelegramClient", Client), patch("telegram_caption_downloader_gui.messagebox.showinfo"):
+            self.app.start_download(retry=True)
+        self.assertIn(1, consumed)
+        logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
+        self.assertIn("读取消息ID > 0", logs)
 
     def test_retry_rescans_old_messages_after_keyword_alias_is_added(self):
         root = Path(self.app_directory.name)
@@ -1930,6 +2352,218 @@ class GuiFlowTests(unittest.TestCase):
         self.assertEqual(len(list(output.glob("*.jpg"))), 4)
         status = load_capture_status(capture_status_path(self.app.status_root, "嫣然心水"))
         self.assertEqual(status["remarks"]["天机阁杀料"]["image_message_ids"], [3, 4, 5, 6])
+
+    def test_yanran_guaiguai_flow_extends_similar_groups_two_steps(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "嫣然心水", "@yanran")
+        self.app.reload_group_profiles("嫣然心水")
+        (self.app.program_root / "群配置" / "嫣然心水.json").write_text(
+            '{"keywords":["乖乖团队"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+        preview_calls = []
+
+        def image_bytes(color):
+            output = io.BytesIO()
+            Image.new("RGB", (720, 1280), color).save(output, format="JPEG")
+            return output.getvalue()
+
+        blue, red = image_bytes((70, 180, 230)), image_bytes((210, 40, 35))
+
+        class Message:
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+
+            def __init__(self, message_id, caption, group_id, payload):
+                self.id, self.raw_text, self.grouped_id = message_id, caption, group_id
+                self.payload = payload
+
+            async def download_media(self, file):
+                if file is bytes:
+                    preview_calls.append(self.id)
+                    return self.payload
+                Path(file).write_bytes(b"image")
+                return file
+
+        messages = [
+            Message(1, "乖乖团队", 10, blue),
+            Message(2, "", 10, blue),
+            Message(3, "", 20, blue),
+            Message(4, "", 30, red),
+        ]
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter(messages)
+
+        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+        ):
+            self.app.start_download()
+        self.assertEqual(set(preview_calls), {1, 2, 3, 4})
+        output = root / "results" / "9.2-嫣然心水" / "乖乖团队"
+        self.assertEqual(len(list(output.glob("*.jpg"))), 3)
+
+    def test_xinao_expert_zhanxia_flow_drops_unwanted_album_by_ocr_marker(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "新澳高手", "@expert")
+        self.app.reload_group_profiles("新澳高手")
+        (self.app.program_root / "群配置" / "新澳高手.json").write_text(
+            '{"keywords":["斩杀系列"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+
+        class Message:
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+
+            def __init__(self, message_id, caption, group_id, payload):
+                self.id, self.raw_text, self.grouped_id = message_id, caption, group_id
+                self.payload = payload
+
+            async def download_media(self, file):
+                if file is bytes:
+                    return self.payload
+                Path(file).write_bytes(b"image")
+                return file
+
+        messages = [
+            Message(1, "斩杀系列", 10, b"unwanted-cover"),
+            Message(2, "", 10, b"unwanted-second"),
+            Message(3, "斩杀系列", 20, b"wanted-one"),
+            Message(4, "", 20, b"wanted-two"),
+        ]
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter(messages)
+
+        def fake_ocr(payload, labels, _engine, on_error=None, cleanup=None):
+            return {"实力双波"} if payload == b"unwanted-cover" else set()
+
+        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+            patch("telegram_caption_downloader_gui.get_ocr_engine", return_value=object()),
+            patch("telegram_caption_downloader_gui.ocr_labels_from_payload", side_effect=fake_ocr),
+        ):
+            self.app.start_download()
+        output = root / "results" / "9.2-新澳高手"
+        self.assertEqual(len(list((output / "斩杀系列").glob("*.jpg"))), 2)
+        status = load_capture_status(capture_status_path(self.app.status_root, "新澳高手"))
+        self.assertEqual(status["remarks"]["斩杀系列"]["status"], "已完成")
+        self.assertEqual(status["remarks"]["斩杀系列"]["image_message_ids"], [3, 4])
+        self.assertEqual((output / "未匹配备注.txt").read_text(encoding="utf-8-sig"), "")
+        logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
+        self.assertIn("实力双波", logs)
+        self.assertIn("整组 2 张忽略", logs)
+
+    def test_xinao_expert_keeps_all_groups_when_ocr_is_unavailable(self):
+        root = Path(self.app_directory.name)
+        save_group_profile(self.app.program_root, self.app.settings, "", "新澳高手", "@expert")
+        self.app.reload_group_profiles("新澳高手")
+        (self.app.program_root / "群配置" / "新澳高手.json").write_text(
+            '{"keywords":["斩杀系列"]}', encoding="utf-8")
+        self.app.output_path.set(str(root / "results"))
+        self.app.day.set("2026-09-02")
+
+        class Message:
+            date = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+            file, photo = SimpleNamespace(mime_type="image/jpeg", ext=".jpg"), True
+
+            def __init__(self, message_id, caption, group_id):
+                self.id, self.raw_text, self.grouped_id = message_id, caption, group_id
+
+            async def download_media(self, file):
+                if file is bytes:
+                    return b"payload"
+                Path(file).write_bytes(b"image")
+                return file
+
+        messages = [
+            Message(1, "斩杀系列", 10),
+            Message(2, "", 10),
+            Message(3, "斩杀系列", 20),
+            Message(4, "", 20),
+        ]
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def disconnect(self):
+                pass
+
+            def is_user_authorized(self):
+                return True
+
+            def get_me(self):
+                return SimpleNamespace(id=7, phone="8613800000000")
+
+            def get_entity(self, address):
+                return address
+
+            def iter_messages(self, _entity, **_kwargs):
+                return iter(messages)
+
+        self.app.run_worker = lambda operation, success: success(operation())
+        self.app.logged_in, self.app.active_account_id, self.app.active_user_id = True, "legacy", 7
+        with (
+            patch("telethon.sync.TelegramClient", Client),
+            patch("telegram_caption_downloader_gui.messagebox.showinfo"),
+            patch("telegram_caption_downloader_gui.get_ocr_engine", return_value=None),
+        ):
+            self.app.start_download()
+        output = root / "results" / "9.2-新澳高手" / "斩杀系列"
+        self.assertEqual(len(list(output.glob("*.jpg"))), 4)
+        status = load_capture_status(capture_status_path(self.app.status_root, "新澳高手"))
+        self.assertEqual(status["remarks"]["斩杀系列"]["image_message_ids"], [1, 2, 3, 4])
+        logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
+        self.assertIn("未执行不要组过滤", logs)
 
     def test_huangdaxian_ocr_reads_each_neighbor_first_image_once_without_similarity(self):
         root = Path(self.app_directory.name)

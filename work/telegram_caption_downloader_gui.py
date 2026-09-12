@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 import time
@@ -42,9 +43,18 @@ SPECIAL_RETRY_GROUP = "嫣然心水"
 SPECIAL_ADJACENT_LABEL = "乖乖团队"
 YANRAN_ADJACENT_LABELS = {"乖乖团队", "天机阁特围", "天机阁杀料", "恩平"}
 YANRAN_FIRST_IMAGE_OCR_LABELS = {"天机阁特围", "天机阁杀料"}
+VISUAL_ADJACENT_EXTENSION_GROUPS = 2
 HUANGDAXIAN_GROUP = "黄大仙新澳"
 HUANGDAXIAN_OCR_LABELS = {"战狼", "68", "红人馆", "香奈儿"}
 HUANGDAXIAN_ADJACENT_LABELS = HUANGDAXIAN_OCR_LABELS
+MUXI_GROUP = "慕熙会员群"
+MUXI_EXACT_LABELS = {"九肖", "绝杀合数", "帅铁精杀", "四头中特24码中特", "大围"}
+XINAO_EXPERT_GROUP = "新澳高手"
+XINAO_EXPERT_FILTER_LABELS = {"斩杀系列"}
+XINAO_EXPERT_UNWANTED_MARKERS = {
+    "实力双波", "天地中特", "三行中特", "三头必中", "成语解平特",
+    "平特一肖", "赚钱六肖", "五肖", "五码", "小数+双数",
+}
 STATUS_OUTPUT_DIR = Path(r"C:\Users\Administrator\Desktop\每天工具\飞机抓图\outputs\抓取状态")
 DARK_BG = "#17191D"
 DARK_SIDEBAR = "#1C1F24"
@@ -112,6 +122,7 @@ class TelegramRuntimeLogHandler(logging.Handler):
 
 @contextmanager
 def logged_telegram_client(session, api_id, api_hash, write_log):
+    from telethon.sessions import Session
     from telethon.sync import TelegramClient
 
     handler = TelegramRuntimeLogHandler(write_log)
@@ -125,7 +136,8 @@ def logged_telegram_client(session, api_id, api_hash, write_log):
     logger.addHandler(handler)
     client = None
     try:
-        client = TelegramClient(session, api_id, api_hash, base_logger=logger)
+        resolved = session if isinstance(session, Session) else load_account_session(session, write_log)
+        client = TelegramClient(resolved, api_id, api_hash, base_logger=logger)
         yield client
     finally:
         try:
@@ -235,6 +247,65 @@ def account_directory(app_data: Path, account_id: str) -> Path:
     return directory
 
 
+SESSION_BLOB_NAME = "session.bin"
+SESSION_LOCKED_TEXT = "账号会话文件被占用，请关闭其他软件实例或重启软件后再试"
+SESSION_BROKEN_TEXT = "账号会话文件无法读取，请重新登录该账号"
+
+
+def session_blob_path(directory: Path) -> Path:
+    return Path(directory) / SESSION_BLOB_NAME
+
+
+def save_session_string(path: Path, value: str) -> None:
+    encrypted = _dpapi(value.encode("utf-8"), protect=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(encrypted)
+    os.replace(temporary, path)
+
+
+def load_session_string(path: Path) -> str | None:
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        return _dpapi(path.read_bytes(), protect=False).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(SESSION_BROKEN_TEXT) from exc
+
+
+def has_account_session(directory: Path) -> bool:
+    directory = Path(directory)
+    return session_blob_path(directory).is_file() or (directory / "account.session").is_file()
+
+
+def load_account_session(session_path: Path, write_log=None):
+    from telethon.sessions import SQLiteSession, StringSession
+
+    session_path = Path(session_path)
+    directory = session_path.parent
+    saved = load_session_string(session_blob_path(directory))
+    if saved:
+        return StringSession(saved)
+    legacy = Path(str(session_path) + ".session")
+    if not legacy.is_file():
+        return StringSession()
+    try:
+        old = SQLiteSession(str(session_path))
+        try:
+            value = StringSession.save(old)
+        finally:
+            old.close()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(SESSION_LOCKED_TEXT) from exc
+    except (OSError, sqlite3.DatabaseError) as exc:
+        raise ValueError(SESSION_BROKEN_TEXT) from exc
+    save_session_string(session_blob_path(directory), value)
+    if write_log is not None:
+        write_log("【账号】旧会话已迁移为加密字符串，原 .session 文件保留")
+    return StringSession(value)
+
+
 def load_account_profiles(app_data: Path) -> list[dict]:
     path = Path(app_data) / "accounts.json"
     profiles = []
@@ -332,6 +403,25 @@ def split_chat_addresses(value: str) -> list[str]:
             addresses.append(address)
             seen.add(address.casefold())
     return addresses
+
+
+def resolve_private_chat(client, chat_id: int):
+    """Locate a private group by numeric Chat ID using the task account's session."""
+    from telethon import utils
+
+    try:
+        peer = client.get_input_entity(chat_id)
+    except ValueError:
+        peer = None
+        for dialog in client.iter_dialogs():
+            if dialog.id == chat_id:
+                peer = dialog.input_entity
+                break
+        if peer is None:
+            raise ValueError("绑定账号无法定位该私密群，请核对 Chat ID 和入群情况")
+    if utils.get_peer_id(peer) != chat_id:
+        raise ValueError("解析到的群 ID 与配置不一致")
+    return peer
 
 
 def runtime_log_path(log_root: Path, target_day: date, group_name: str = "系统") -> Path:
@@ -458,14 +548,25 @@ def load_group_settings(program_root: Path) -> dict:
             item.get("start_time", "00:00"),
             item.get("end_time", "23:59"),
         )
-        groups.append(
-            {
-                "name": validate_group_name(item["name"]),
-                "address": item["address"].strip(),
-                "start_time": start_time,
-                "end_time": end_time,
-            }
-        )
+        group = {
+            "name": validate_group_name(item["name"]),
+            "address": item["address"].strip(),
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+        chat_id = item.get("chat_id")
+        bound_account_id = item.get("bound_account_id")
+        if chat_id is not None or bound_account_id is not None:
+            if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id >= 0:
+                raise ValueError("群配置文件包含无效的私密群 Chat ID")
+            if not isinstance(bound_account_id, str) or not bound_account_id.strip():
+                raise ValueError("群配置文件包含无效的绑定账号")
+            bound_account_id = bound_account_id.strip()
+            if bound_account_id != "legacy" and not re.fullmatch(r"[0-9a-f]{32}", bound_account_id):
+                raise ValueError("群配置文件包含无效的绑定账号")
+            group["chat_id"] = chat_id
+            group["bound_account_id"] = bound_account_id
+        groups.append(group)
     settings["groups"] = groups
     if isinstance(payload.get("selected_group"), str):
         settings["selected_group"] = payload["selected_group"]
@@ -484,11 +585,25 @@ def save_group_profile(
     address: str,
     start_time: str = "00:00",
     end_time: str = "23:59",
+    *,
+    chat_id: int | None = None,
+    bound_account_id: str | None = None,
 ) -> None:
     new_name = validate_group_name(new_name)
     address = address.strip()
-    if not address:
-        raise ValueError("群地址不能为空，请填写 @用户名、t.me 链接或完整群名")
+    if chat_id is None:
+        if not address:
+            raise ValueError("群地址不能为空，请填写 @用户名、t.me 链接或完整群名")
+        bound_account_id = None
+    else:
+        if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id >= 0:
+            raise ValueError("私密群 Chat ID 必须是负数整数，例如 -1004401898428")
+        if not isinstance(bound_account_id, str) or not bound_account_id.strip():
+            raise ValueError("私密群必须选择绑定账号")
+        bound_account_id = bound_account_id.strip()
+        if bound_account_id != "legacy" and not re.fullmatch(r"[0-9a-f]{32}", bound_account_id):
+            raise ValueError("绑定账号标识无效")
+        address = ""
     start_time, end_time = validate_time_range(start_time, end_time)
     groups = settings.setdefault("groups", [])
     duplicate = next((item for item in groups if item["name"].casefold() == new_name.casefold() and item["name"] != old_name), None)
@@ -509,10 +624,18 @@ def save_group_profile(
             else:
                 write_notes_config(new_path, [])
         current.update(name=new_name, address=address, start_time=start_time, end_time=end_time)
+        if chat_id is None:
+            current.pop("chat_id", None)
+            current.pop("bound_account_id", None)
+        else:
+            current["chat_id"] = chat_id
+            current["bound_account_id"] = bound_account_id
     else:
-        groups.append(
-            {"name": new_name, "address": address, "start_time": start_time, "end_time": end_time}
-        )
+        group = {"name": new_name, "address": address, "start_time": start_time, "end_time": end_time}
+        if chat_id is not None:
+            group["chat_id"] = chat_id
+            group["bound_account_id"] = bound_account_id
+        groups.append(group)
         notes_path = group_notes_path(program_root, new_name)
         if not notes_path.exists():
             write_notes_config(notes_path, [])
@@ -640,9 +763,9 @@ def validate_time_range(start_time: str, end_time: str) -> tuple[str, str]:
 
 
 def caption_matches_keyword(caption: str, keyword: str, exact: bool = False) -> bool:
+    compact = lambda text: "".join(char for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
     if exact:
-        compact_caption = "".join(char for char in caption if char.isalnum() or "\u4e00" <= char <= "\u9fff")
-        return compact_caption == keyword.casefold()
+        return compact(caption) == compact(keyword.casefold())
     return keyword.casefold() in caption
 
 
@@ -725,23 +848,27 @@ def add_similar_immediate_groups(
     anchors = []
     for index, group in enumerate(groups):
         for label in labels:
-            if any(label in selection.get(message.id, set()) for message in group):
-                if label in bidirectional_labels:
-                    if index > 0:
-                        anchors.append((index, label, groups[index - 1]))
-                    if index + 1 < len(groups):
-                        anchors.append((index, label, groups[index + 1]))
-                elif index + 1 < len(groups):
-                    anchors.append((index, label, groups[index + 1]))
-    for index, label, candidate in anchors:
-        similar = group_similarity(groups[index], candidate)
-        if log:
-            log(f"【识别】{label} 相邻组检查：锚点消息 {groups[index][0].id}；"
-                f"{media_group_description(candidate)}；"
-                + (f"相似，整组 {len(candidate)} 张归入 {label}" if similar else "未通过相似度检查，不据此归类"))
-        if similar:
+            if not any(label in selection.get(message.id, set()) for message in group):
+                continue
+            steps = (1, -1) if label in bidirectional_labels else (1,)
+            anchors.extend((index, step, label) for step in steps)
+    for index, step, label in anchors:
+        previous = groups[index]
+        for distance in range(1, VISUAL_ADJACENT_EXTENSION_GROUPS + 1):
+            neighbor_index = index + step * distance
+            if not 0 <= neighbor_index < len(groups):
+                break
+            candidate = groups[neighbor_index]
+            similar = group_similarity(previous, candidate)
+            if log:
+                log(f"【识别】{label} 相邻组检查：基准消息 {previous[0].id}；"
+                    f"{media_group_description(candidate)}；"
+                    + (f"相似，整组 {len(candidate)} 张归入 {label}" if similar else "未通过相似度检查，不据此归类"))
+            if not similar:
+                break
             for message in candidate:
                 selection[message.id].add(label)
+            previous = candidate
     return dict(selection)
 
 
@@ -764,12 +891,25 @@ def collect_adjacent_preview_messages(
         if not matched_labels:
             continue
         preview_ids.update(message.id for message in group)
-        neighbor_indexes: set[int] = {index + 1}
+        neighbor_indexes: set[int] = {index + 1, index + 2}
         if matched_labels.intersection(bidirectional_labels):
-            neighbor_indexes.add(index - 1)
+            neighbor_indexes.update({index - 1, index - 2})
         for neighbor_index in neighbor_indexes:
             if 0 <= neighbor_index < len(groups):
                 preview_ids.update(message.id for message in groups[neighbor_index])
+    return preview_ids
+
+
+def collect_label_group_messages(
+    messages,
+    selection: dict[int, set[str]],
+    labels: set[str],
+) -> set[int]:
+    """Return every message of each group that matched one of the labels."""
+    preview_ids: set[int] = set()
+    for group in ordered_media_groups(messages):
+        if any(label in selection.get(message.id, set()) for message in group for label in labels):
+            preview_ids.update(message.id for message in group)
     return preview_ids
 
 
@@ -812,7 +952,11 @@ def ocr_engine_error_text() -> str:
     return "；".join(details)
 
 
-def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, on_error=None) -> set[str]:
+def compact_text(text: str) -> str:
+    return "".join(char for char in normalized(text).casefold() if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+
+
+def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, on_error=None, cleanup=None) -> set[str]:
     """Read image text and return configured labels found in any OCR text line."""
     if not payload or not labels:
         return set()
@@ -835,7 +979,8 @@ def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, o
             texts = result.get("rec_texts", [])
             if isinstance(texts, (list, tuple)):
                 recognized.extend(str(text) for text in texts)
-    haystack = "".join(normalized("".join(recognized)).casefold().split())
+    clean = cleanup or (lambda text: "".join(normalized(text).casefold().split()))
+    haystack = clean("".join(recognized))
     variants = {
         "战狼": ("战狼", "戰狼"),
         "红人馆": ("红人馆", "紅人館"),
@@ -847,7 +992,7 @@ def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, o
     matched = set()
     for label in labels:
         candidates = variants.get(label, (label,))
-        if any("".join(normalized(candidate).casefold().split()) in haystack for candidate in candidates):
+        if any(clean(candidate) in haystack for candidate in candidates):
             matched.add(label)
     return matched
 
@@ -964,6 +1109,70 @@ def add_first_image_ocr_immediate_groups(
         if on_progress:
             on_progress(done, total)
     return dict(selection)
+
+
+def filter_unwanted_ocr_groups(
+    messages,
+    selection: dict[int, set[str]],
+    labels: set[str],
+    payloads: dict[int, bytes],
+    markers: set[str],
+    ocr_engine=None,
+    log=None,
+    on_progress=None,
+) -> tuple[dict[int, set[str]], dict[str, set[int]]]:
+    """Drop whole caption-matched groups whose images contain any unwanted OCR marker."""
+    messages = list(messages)
+    selection = defaultdict(set, {message_id: set(value) for message_id, value in selection.items()})
+    ignored: dict[str, set[int]] = defaultdict(set)
+    if not labels or not markers:
+        return dict(selection), {}
+    candidates = [
+        group
+        for group in ordered_media_groups(messages)
+        if any(label in selection.get(message.id, set()) for message in group for label in labels)
+    ]
+    for done, group in enumerate(candidates, 1):
+        matched_labels = {
+            label
+            for label in labels
+            if any(label in selection.get(message.id, set()) for message in group)
+        }
+        hit_markers: set[str] = set()
+        for message in sorted(group, key=lambda item: item.id):
+            payload = payloads.get(message.id)
+            if not payload:
+                continue
+            hits = ocr_labels_from_payload(
+                payload,
+                markers,
+                ocr_engine,
+                on_error=lambda error, current=message: log and log(
+                    f"【识别】OCR失败：消息 {current.id}（{error}）"
+                ),
+                cleanup=compact_text,
+            )
+            if hits:
+                hit_markers.update(hits)
+                break
+        if hit_markers:
+            for message in group:
+                remaining = selection.get(message.id, set()) - matched_labels
+                if remaining:
+                    selection[message.id] = remaining
+                else:
+                    selection.pop(message.id, None)
+            for label in matched_labels:
+                ignored[label].update(message.id for message in group)
+            if log:
+                log(f"【识别】{'、'.join(sorted(matched_labels))}：{media_group_description(group)} "
+                    f"命中「{'、'.join(sorted(hit_markers))}」→ 整组 {len(group)} 张忽略")
+        elif log:
+            log(f"【识别】{'、'.join(sorted(matched_labels))}：{media_group_description(group)} "
+                f"未命中不要组特征词 → 保留整组 {len(group)} 张")
+        if on_progress:
+            on_progress(done, len(candidates))
+    return dict(selection), dict(ignored)
 
 
 def image_color_signature(payload: bytes) -> tuple[tuple[float, ...], float] | None:
@@ -1949,7 +2158,7 @@ class TelegramDownloaderApp:
             profile["name"] = name
             directory = account_directory(self.app_data, profile["id"])
             if automatic:
-                if not (directory / "account.session").is_file():
+                if not has_account_session(directory):
                     raise ValueError("所选账号的本地会话不存在，请点击“选择账号 / 登录”手动登录；不会自动换号")
             else:
                 save_selected_account(self.app_data, profile["id"])
@@ -1979,6 +2188,10 @@ class TelegramDownloaderApp:
                     user = client.get_me()
                     verify_account_user(profile, user, phone)
                     profile["user_id"] = user.id
+                    saver = getattr(getattr(client, "session", None), "save", None)
+                    session_value = saver() if callable(saver) else ""
+                    if isinstance(session_value, str) and session_value:
+                        save_session_string(session_blob_path(directory), session_value)
                     save_saved_credentials(directory / "credentials.bin", api_id, api_hash, phone)
                     save_account_profile(self.app_data, profile)
                     return user.first_name or user.username or str(user.id), user.id
@@ -1990,8 +2203,12 @@ class TelegramDownloaderApp:
                     "当前会话与所选账号不一致，已停止操作，原会话保留",
                     "当前会话与所选手机号不一致，已停止操作，原会话保留",
                     "无法确认当前会话的账号身份，请检查所选账号",
+                    SESSION_LOCKED_TEXT,
+                    SESSION_BROKEN_TEXT,
                 }
                 detail = str(exc) if str(exc) in safe_messages else type(exc).__name__
+                if isinstance(exc, sqlite3.OperationalError):
+                    detail = f"{type(exc).__name__}: {exc}"
                 if "Flood" in type(exc).__name__ and isinstance(getattr(exc, "seconds", None), int):
                     detail = f"FLOOD_WAIT，需等待 {exc.seconds} 秒后再尝试"
                 raise RuntimeError(f"账号登录未完成：{detail}") from None
@@ -2013,13 +2230,11 @@ class TelegramDownloaderApp:
 
         self.run_worker(operation, success)
 
-    def validate_task(self) -> tuple[Path, Path, date, clock_time, clock_time, str, str, int, str]:
-        api_id, api_hash, _ = self.selected_credentials()
+    def validate_task(self) -> tuple[Path, Path, date, clock_time, clock_time, str, dict]:
         group_name = self.chat.get().strip()
-        profile = self.selected_group_profile()
-        chat = profile["address"]
-        start_clock = parse_clock(profile["start_time"])
-        end_clock = parse_clock(profile["end_time"])
+        group_profile = dict(self.selected_group_profile())
+        start_clock = parse_clock(group_profile["start_time"])
+        end_clock = parse_clock(group_profile["end_time"])
         notes_file = group_notes_path(self.program_root, group_name).resolve()
         if not notes_file.is_file():
             raise ValueError("该群的同名备注 JSON 不存在，请在设置里重新保存群配置")
@@ -2030,13 +2245,10 @@ class TelegramDownloaderApp:
             target_day = parse_day(self.day.get())
         except ValueError as exc:
             raise ValueError("日期格式应为 YYYY-MM-DD") from exc
-        return notes_file, output, target_day, start_clock, end_clock, group_name, chat, api_id, api_hash
+        return notes_file, output, target_day, start_clock, end_clock, group_name, group_profile
 
     def start_download(self, notes_override: dict[str, str] | None = None, retry: bool = False) -> None:
         if self._busy:
-            return
-        if not self.logged_in or not self.active_account_id or self.active_account_id != self.selected_account_id:
-            messagebox.showwarning("尚未登录", "请先点击“选择账号 / 登录”")
             return
         try:
             (
@@ -2046,19 +2258,43 @@ class TelegramDownloaderApp:
                 start_clock,
                 end_clock,
                 group_name,
-                chat,
-                api_id,
-                api_hash,
+                group_profile,
             ) = self.validate_task()
             notes = notes_override if notes_override is not None else load_notes(notes_file, allow_empty=True)
-            account_id = self.active_account_id
-            session_path = account_directory(self.app_data, account_id) / "account"
-            _, _, account_phone = self.selected_credentials()
-            account_profile = {"user_id": self.active_user_id}
+            chat = group_profile["address"]
+            chat_id = group_profile.get("chat_id")
+            if chat_id is not None:
+                task_account_id = group_profile.get("bound_account_id", "")
+                account_profile = next(
+                    (dict(item) for item in self.account_profiles if item["id"] == task_account_id), None
+                )
+                if account_profile is None:
+                    raise ValueError("私密群绑定的账号不存在，请在“选择账号 / 登录”中登录该账号后重试")
+                task_directory = account_directory(self.app_data, task_account_id)
+                saved = load_saved_credentials(task_directory / "credentials.bin")
+                if saved is None:
+                    raise ValueError("私密群绑定账号的登录配置不存在，请先登录该账号后重试")
+                if not has_account_session(task_directory):
+                    raise ValueError("私密群绑定账号的本地会话不存在，请先登录该账号后重试")
+            else:
+                if not self.logged_in or not self.active_account_id or self.active_account_id != self.selected_account_id:
+                    messagebox.showwarning("尚未登录", "请先点击“选择账号 / 登录”")
+                    return
+                task_account_id = self.active_account_id
+                account_profile = {"user_id": self.active_user_id}
+                task_directory = account_directory(self.app_data, task_account_id)
+                saved = load_saved_credentials(task_directory / "credentials.bin")
+                if saved is None:
+                    raise ValueError("所选账号的登录配置不存在，原会话文件未改动")
+            api_id, api_hash, account_phone = saved
+            session_path = task_directory / "account"
         except (OSError, ValueError) as exc:
             messagebox.showwarning("信息不完整", str(exc))
             return
+        active_account_id = self.active_account_id
         self._set_log_group(group_name)
+        if chat_id is not None:
+            self.log(f"【账号】本次私密群抓取使用：{account_profile.get('name') or task_account_id}；Chat ID：{chat_id}")
 
         def operation() -> tuple[int, int, int, int, Path, float]:
             operation_started = time.monotonic()
@@ -2108,33 +2344,41 @@ class TelegramDownloaderApp:
             end_utc = end_local.astimezone(timezone.utc)
 
             chats = split_chat_addresses(chat)
-            if not chats:
+            if chat_id is None and not chats:
                 raise ValueError("群地址不能为空，请在设置里填写至少一个 Telegram 群地址")
             with logged_telegram_client(str(session_path), api_id, api_hash, self.log) as client:
                 client.connect()
                 if not client.is_user_authorized():
-                    self.root.after(0, self._clear_login_state)
-                    raise RuntimeError("登录已失效，请重新登录")
+                    if task_account_id == active_account_id:
+                        self.root.after(0, self._clear_login_state)
+                        raise RuntimeError("登录已失效，请重新登录")
+                    raise RuntimeError(
+                        f"绑定账号 {account_profile.get('name') or task_account_id} 的登录已失效，请重新登录该账号后重试"
+                    )
                 try:
                     verify_account_user(account_profile, client.get_me(), account_phone)
                 except (RuntimeError, ValueError):
-                    self.root.after(0, self._clear_login_state)
+                    if task_account_id == active_account_id:
+                        self.root.after(0, self._clear_login_state)
                     raise
                 entities = []
-                for chat_address in chats:
-                    try:
-                        entity = client.get_entity(chat_address)
-                    except (ValueError, TypeError):
-                        wanted = normalized(chat_address).casefold()
-                        matches = [
-                            d.entity
-                            for d in client.iter_dialogs()
-                            if normalized(d.name or "").casefold() == wanted
-                        ]
-                        if len(matches) != 1:
-                            raise ValueError("无法唯一找到该群，请改用 @用户名或 t.me 链接")
-                        entity = matches[0]
-                    entities.append((chat_address, entity))
+                if chat_id is not None:
+                    entities.append((str(chat_id), resolve_private_chat(client, chat_id)))
+                else:
+                    for chat_address in chats:
+                        try:
+                            entity = client.get_entity(chat_address)
+                        except (ValueError, TypeError):
+                            wanted = normalized(chat_address).casefold()
+                            matches = [
+                                d.entity
+                                for d in client.iter_dialogs()
+                                if normalized(d.name or "").casefold() == wanted
+                            ]
+                            if len(matches) != 1:
+                                raise ValueError("无法唯一找到该群，请改用 @用户名或 t.me 链接")
+                            entity = matches[0]
+                        entities.append((chat_address, entity))
 
                 self.log(
                     f"【扫描】正在{'增量' if incremental else '全量'}扫描 {len(entities)} 个群（逐个扫描） {target_day} "
@@ -2213,6 +2457,8 @@ class TelegramDownloaderApp:
                         except TypeError:
                             iterator = client.iter_messages(entity, offset_date=end_utc)
                         for message in iterator:
+                            if message.date < start_utc:
+                                break
                             add_message(message, require_new=True, min_id=source_last_id)
                             if message is not None and getattr(message, "id", None) in seen_ids:
                                 source_ids.append(message.id)
@@ -2253,6 +2499,11 @@ class TelegramDownloaderApp:
                     bidirectional_labels.update(adjacent_labels)
                     if "战狼" in adjacent_labels:
                         exact_labels.add("战狼")
+                if group_name == MUXI_GROUP:
+                    exact_labels.update(MUXI_EXACT_LABELS.intersection(scan_notes.values()))
+                marker_filter_labels = set()
+                if group_name == XINAO_EXPERT_GROUP:
+                    marker_filter_labels.update(XINAO_EXPERT_FILTER_LABELS.intersection(scan_notes.values()))
                 selection = (
                     {}
                     if incremental and notes and not scan_notes
@@ -2267,7 +2518,8 @@ class TelegramDownloaderApp:
                     )
                 )
                 preview_cache: dict[int, bytes] = {}
-                if visual_adjacent_labels or first_image_ocr_labels:
+                ignored_note_ids: dict[str, set[int]] = defaultdict(set)
+                if visual_adjacent_labels or first_image_ocr_labels or marker_filter_labels:
                     groups = ordered_media_groups(media_messages)
                     preview_ids: set[int] = set()
                     first_image_preview_ids: set[int] = set()
@@ -2288,6 +2540,10 @@ class TelegramDownloaderApp:
                             bidirectional_labels,
                         )
                         preview_ids.update(first_image_preview_ids)
+                    if marker_filter_labels:
+                        preview_ids.update(
+                            collect_label_group_messages(media_messages, selection, marker_filter_labels)
+                        )
                     preview_messages = {
                         message.id: message for message in media_messages if message.id in preview_ids
                     }
@@ -2325,20 +2581,21 @@ class TelegramDownloaderApp:
                         if owns_preview_loop:
                             preview_loop.close()
 
-                    self.set_progress(0, 0, f"图片比对：共 {len(groups)} 组")
-                    selection = build_download_selection(
-                        media_messages,
-                        scan_notes,
-                        special_adjacent_labels=adjacent_labels,
-                        bidirectional_adjacent_labels=bidirectional_labels,
-                        exact_labels=exact_labels,
-                        similarity_labels=visual_adjacent_labels,
-                        group_similarity=lambda anchor, candidate: image_groups_are_similar(
-                            [preview_cache[message.id] for message in anchor if message.id in preview_cache],
-                            [preview_cache[message.id] for message in candidate if message.id in preview_cache],
-                        ),
-                        log=self.log,
-                    )
+                    if visual_adjacent_labels or first_image_ocr_labels:
+                        self.set_progress(0, 0, f"图片比对：共 {len(groups)} 组")
+                        selection = build_download_selection(
+                            media_messages,
+                            scan_notes,
+                            special_adjacent_labels=adjacent_labels,
+                            bidirectional_adjacent_labels=bidirectional_labels,
+                            exact_labels=exact_labels,
+                            similarity_labels=visual_adjacent_labels,
+                            group_similarity=lambda anchor, candidate: image_groups_are_similar(
+                                [preview_cache[message.id] for message in anchor if message.id in preview_cache],
+                                [preview_cache[message.id] for message in candidate if message.id in preview_cache],
+                            ),
+                            log=self.log,
+                        )
                     if first_image_ocr_labels and first_image_preview_ids:
                         self.set_progress(0, 0, "加载 OCR 模型…")
                         ocr_engine = get_ocr_engine()
@@ -2366,6 +2623,28 @@ class TelegramDownloaderApp:
                                     phase_started=ocr_started,
                                 ),
                             )
+                    if marker_filter_labels:
+                        self.set_progress(0, 0, "标题识别：检查不要组特征词…")
+                        marker_engine = get_ocr_engine()
+                        if marker_engine is None:
+                            self.log(f"【识别】图片文字识别不可用，未执行不要组过滤：{ocr_engine_error_text()}")
+                        else:
+                            marker_started = time.monotonic()
+                            selection, ignored_ids = filter_unwanted_ocr_groups(
+                                media_messages,
+                                selection,
+                                marker_filter_labels,
+                                preview_cache,
+                                XINAO_EXPERT_UNWANTED_MARKERS,
+                                ocr_engine=marker_engine,
+                                log=self.log,
+                                on_progress=lambda done, total: self.set_progress(
+                                    done, total, f"标题识别：{done} / {total}",
+                                    phase_started=marker_started,
+                                ),
+                            )
+                            for label, ids in ignored_ids.items():
+                                ignored_note_ids[label].update(ids)
                 matched_total = sum(message.id in selection for message in media_messages)
                 self.set_progress(
                     0,
@@ -2471,6 +2750,9 @@ class TelegramDownloaderApp:
 
                 labels = list(dict.fromkeys(notes.values()))
                 note_matches = build_note_message_ids(all_messages, scan_notes, exact_labels=exact_labels)
+                for label, ignored_message_ids in ignored_note_ids.items():
+                    if label in note_matches:
+                        note_matches[label] -= ignored_message_ids
                 broad_exact_matches = build_note_message_ids(
                     all_messages, {keyword: label for keyword, label in scan_notes.items() if label in exact_labels},
                 )
@@ -2590,18 +2872,34 @@ class GroupSettingsDialog:
         )
         ttk.Label(frame, text="群地址").grid(row=1, column=0, sticky="w", pady=5)
         self.address = StringVar()
-        ttk.Entry(frame, textvariable=self.address, font=FORM_FONT).grid(
-            row=1, column=1, sticky="ew", pady=5, padx=(10, 0)
-        )
+        self.address_entry = ttk.Entry(frame, textvariable=self.address, font=FORM_FONT)
+        self.address_entry.grid(row=1, column=1, sticky="ew", pady=5, padx=(10, 0))
         ttk.Label(
             frame,
             text="群地址可填写 @用户名、t.me 链接或完整群名；多个群请用 | 分隔。",
             style="Hint.TLabel",
         ).grid(row=2, column=1, sticky="w", pady=(0, 8), padx=(10, 0))
+        ttk.Label(frame, text="Chat ID（私密群）").grid(row=3, column=0, sticky="w", pady=5)
+        self.chat_id = StringVar()
+        ttk.Entry(frame, textvariable=self.chat_id, font=FORM_FONT).grid(
+            row=3, column=1, sticky="ew", pady=5, padx=(10, 0)
+        )
+        ttk.Label(frame, text="绑定账号").grid(row=4, column=0, sticky="w", pady=5)
+        self.bound_account = StringVar()
+        self.bound_account_combo = ttk.Combobox(
+            frame, textvariable=self.bound_account, state="readonly", font=FORM_FONT
+        )
+        self.bound_account_combo.grid(row=4, column=1, sticky="ew", pady=5, padx=(10, 0))
+        ttk.Label(
+            frame,
+            text="只抓公开群时留空；填写负数 Chat ID 并选择绑定账号后，本配置只抓该 ID，地址保存为空。",
+            style="Hint.TLabel",
+        ).grid(row=5, column=1, sticky="w", pady=(0, 8), padx=(10, 0))
+        self.chat_id.trace_add("write", lambda *_args: self.toggle_private_fields())
         frame.columnconfigure(1, weight=1)
 
         time_frame = ttk.Frame(frame)
-        time_frame.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        time_frame.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.all_day = BooleanVar(value=True)
         ttk.Checkbutton(time_frame, text="全天", variable=self.all_day, command=self.toggle_time_fields).pack(side="left")
         ttk.Label(time_frame, text="开始时间").pack(side="left", padx=(18, 6))
@@ -2615,25 +2913,48 @@ class GroupSettingsDialog:
 
         self.tree = ttk.Treeview(frame, columns=("name", "address", "time"), show="headings", height=10)
         self.tree.heading("name", text="自定义群名称")
-        self.tree.heading("address", text="群地址")
+        self.tree.heading("address", text="群地址 / Chat ID")
         self.tree.heading("time", text="时间范围")
         self.tree.column("name", width=160)
         self.tree.column("address", width=330)
         self.tree.column("time", width=150)
-        self.tree.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=(4, 10))
+        self.tree.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(4, 10))
         self.tree.bind("<<TreeviewSelect>>", self.select_item)
-        frame.rowconfigure(4, weight=1)
+        frame.rowconfigure(7, weight=1)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="ew")
+        buttons.grid(row=8, column=0, columnspan=2, sticky="ew")
         ttk.Button(buttons, text="新增", command=self.new_item).pack(side="left")
         ttk.Button(buttons, text="保存", command=self.save_item).pack(side="left", padx=8)
         ttk.Button(buttons, text="删除配置", command=self.delete_item).pack(side="left")
         ttk.Button(buttons, text="打开配置文件夹", command=self.open_folder).pack(side="left", padx=8)
         ttk.Button(buttons, text="关闭", command=self.window.destroy).pack(side="right")
         self.toggle_time_fields()
+        self.toggle_private_fields()
         self.refresh()
-        app._center_dialog(self.window, 860, 620)
+        app._center_dialog(self.window, 900, 720)
+
+    def account_choices(self) -> list[str]:
+        return [f"{index + 1}. {profile['name']}" for index, profile in enumerate(self.app.account_profiles)]
+
+    def selected_bound_account_id(self) -> str:
+        index = self.bound_account_combo.current()
+        profiles = self.app.account_profiles
+        if 0 <= index < len(profiles):
+            return profiles[index]["id"]
+        return ""
+
+    def set_bound_account(self, account_id: str) -> None:
+        index = next((i for i, profile in enumerate(self.app.account_profiles) if profile["id"] == account_id), -1)
+        if index >= 0:
+            self.bound_account_combo.current(index)
+        else:
+            self.bound_account_combo.set("")
+        self.bound_account.set(self.bound_account_combo.get())
+
+    def toggle_private_fields(self) -> None:
+        private = bool(self.chat_id.get().strip())
+        self.address_entry.configure(state="disabled" if private else "normal")
 
     def toggle_time_fields(self) -> None:
         if self.all_day.get():
@@ -2646,10 +2967,12 @@ class GroupSettingsDialog:
     def refresh(self, selected: str = "") -> None:
         for item_id in self.tree.get_children():
             self.tree.delete(item_id)
+        self.bound_account_combo.configure(values=self.account_choices())
         selected_id = None
         for item in self.app.settings.get("groups", []):
             time_range = f"{item['start_time']} ～ {item['end_time']}"
-            item_id = self.tree.insert("", "end", values=(item["name"], item["address"], time_range))
+            address = str(item["chat_id"]) if item.get("chat_id") is not None else item["address"]
+            item_id = self.tree.insert("", "end", values=(item["name"], address, time_range))
             if item["name"] == selected:
                 selected_id = item_id
         if selected_id:
@@ -2660,25 +2983,38 @@ class GroupSettingsDialog:
         selection = self.tree.selection()
         if not selection:
             return
-        name, address, _time_range = self.tree.item(selection[0], "values")
+        name = self.tree.item(selection[0], "values")[0]
         profile = next(item for item in self.app.settings["groups"] if item["name"] == name)
         self.selected_name = name
         self.name.set(name)
-        self.address.set(address)
+        self.address.set(profile["address"])
+        chat_id = profile.get("chat_id")
+        self.chat_id.set(str(chat_id) if chat_id is not None else "")
+        self.set_bound_account(profile.get("bound_account_id", ""))
         self.start_time.set(profile["start_time"])
         self.end_time.set(profile["end_time"])
         self.all_day.set(profile["start_time"] == "00:00" and profile["end_time"] == "23:59")
         self.toggle_time_fields()
+        self.toggle_private_fields()
 
     def new_item(self) -> None:
         self.selected_name = ""
         self.name.set("")
         self.address.set("")
+        self.chat_id.set("")
+        self.set_bound_account("")
         self.all_day.set(True)
         self.toggle_time_fields()
+        self.toggle_private_fields()
 
     def save_item(self) -> None:
         try:
+            chat_id_text = self.chat_id.get().strip()
+            chat_id = None
+            if chat_id_text:
+                if not re.fullmatch(r"-\d+", chat_id_text):
+                    raise ValueError("Chat ID 必须是负数整数，例如 -1004401898428")
+                chat_id = int(chat_id_text)
             save_group_profile(
                 self.app.program_root,
                 self.app.settings,
@@ -2687,6 +3023,8 @@ class GroupSettingsDialog:
                 self.address.get(),
                 "00:00" if self.all_day.get() else self.start_time.get(),
                 "23:59" if self.all_day.get() else self.end_time.get(),
+                chat_id=chat_id,
+                bound_account_id=self.selected_bound_account_id() or None,
             )
         except (OSError, ValueError) as exc:
             messagebox.showwarning("无法保存", str(exc), parent=self.window)
