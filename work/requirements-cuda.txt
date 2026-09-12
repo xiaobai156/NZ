@@ -1,4 +1,4 @@
-# CPU OCR runtime (Windows x64)
-paddlepaddle==3.2.2
+# GPU-only OCR runtime (Windows x64; install from official cu118 index)
+paddlepaddle-gpu==3.2.2
 paddleocr==3.7.0
 telethon==1.44.0

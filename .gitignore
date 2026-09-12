@@ -38,3 +38,9 @@ outputs/抓取状态/
 work/*_probe*.json
 work/ocr_*.json
 *.log
+
+# Local runtime data, virtualenvs, OCR models and onedir output
+运行数据/
+.venv/
+models/
+outputs/_internal/

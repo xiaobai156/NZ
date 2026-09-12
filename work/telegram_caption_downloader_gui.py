@@ -32,7 +32,11 @@ from PIL import Image, UnidentifiedImageError
 
 
 CN_TZ = timezone(timedelta(hours=8))
-APP_DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TelegramCaptionDownloader"
+APP_DATA = (
+    (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+     else Path(__file__).resolve().parent).parent
+    / "运行数据"
+)
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 APP_VERSION = "v5.2.5"
 GROUP_DIR_NAME = "群配置"
@@ -913,6 +917,18 @@ def collect_label_group_messages(
     return preview_ids
 
 
+class OcrError(RuntimeError):
+    """Required OCR did not complete reliably."""
+
+
+OCR_DEVICE = "gpu:0"
+OCR_MODEL_DET = "PP-OCRv6_small_det"
+OCR_MODEL_REC = "PP-OCRv6_small_rec"
+
+
+def ocr_model_root() -> Path:
+    base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return base.parent / "models"
 _OCR_ENGINE = None
 _OCR_ENGINE_ERROR: Exception | None = None
 
@@ -922,21 +938,42 @@ def get_ocr_engine():
     if _OCR_ENGINE is not None:
         return _OCR_ENGINE
     if _OCR_ENGINE_ERROR is not None:
-        return None
+        raise OcrError(
+            "GPU OCR 不可用，CPU 识别已禁用。请修复环境后重启软件。"
+            "原因：" + ocr_engine_error_text()
+        ) from _OCR_ENGINE_ERROR
     try:
+        import paddle
+
+        if not paddle.is_compiled_with_cuda():
+            raise RuntimeError("当前 Paddle 不支持 CUDA，请安装 paddlepaddle-gpu")
+        if paddle.device.cuda.device_count() < 1:
+            raise RuntimeError("未检测到可用的 CUDA GPU，请检查显卡和驱动")
+        paddle.set_device(OCR_DEVICE)
+        if str(paddle.device.get_device()).lower() != OCR_DEVICE:
+            raise RuntimeError(f"Paddle 未切换到 {OCR_DEVICE}，实际设备为 {paddle.device.get_device()}")
+
         from paddleocr import PaddleOCR
 
-        _OCR_ENGINE = PaddleOCR(
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="PP-OCRv5_mobile_rec",
-            device="cpu",
+        engine = PaddleOCR(
+            text_detection_model_name=OCR_MODEL_DET,
+            text_recognition_model_name=OCR_MODEL_REC,
+            device=OCR_DEVICE,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            enable_hpi=False,
+            use_tensorrt=False,
+            precision="fp32",
+            enable_mkldnn=False,
         )
-    except Exception as exc:  # pragma: no cover - depends on optional runtime/model files
+    except Exception as exc:  # pragma: no cover - depends on optional GPU runtime/model files
         _OCR_ENGINE_ERROR = exc
-        return None
+        raise OcrError(
+            "GPU OCR 初始化失败，CPU 识别已禁用。请修复环境后重启软件。"
+            "原因：" + ocr_engine_error_text()
+        ) from exc
+    _OCR_ENGINE = engine
     return _OCR_ENGINE
 
 
@@ -958,27 +995,44 @@ def compact_text(text: str) -> str:
 
 def ocr_labels_from_payload(payload: bytes, labels: set[str], ocr_engine=None, on_error=None, cleanup=None) -> set[str]:
     """Read image text and return configured labels found in any OCR text line."""
-    if not payload or not labels:
+    if not labels:
         return set()
-    engine = ocr_engine or get_ocr_engine()
-    if engine is None:
-        return set()
+    if not payload:
+        raise OcrError("OCR 必需图片为空，无法完成识别；本次任务已中止")
+    engine = get_ocr_engine() if ocr_engine is None else ocr_engine
     try:
         import numpy as np
 
         with Image.open(io.BytesIO(payload)) as image:
             image_array = np.asarray(image.convert("RGB"))
-        results = engine.predict(image_array)
+        results = list(engine.predict(image_array))
+        if not results:
+            raise RuntimeError("OCR 没有返回该图片的结果对象")
     except Exception as exc:
         if on_error:
             on_error(type(exc).__name__)
-        return set()
-    recognized: list[str] = []
-    for result in results or []:
-        if isinstance(result, dict):
-            texts = result.get("rec_texts", [])
-            if isinstance(texts, (list, tuple)):
-                recognized.extend(str(text) for text in texts)
+        if isinstance(exc, OcrError):
+            raise
+        raise OcrError(
+            "OCR 识别未完成，本次任务已中止；不会使用 CPU 或把失败当作未命中。"
+            f"原因：{type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        recognized: list[str] = []
+        for result in results:
+            if not isinstance(result, dict) or "rec_texts" not in result:
+                raise RuntimeError("OCR 返回的结果结构无效")
+            texts = result["rec_texts"]
+            if not isinstance(texts, (list, tuple)):
+                raise RuntimeError("OCR 返回的 rec_texts 结构无效")
+            recognized.extend(str(text) for text in texts)
+    except Exception as exc:
+        if on_error:
+            on_error(type(exc).__name__)
+        raise OcrError(
+            "OCR 结果读取未完成，本次任务已中止；不会使用 CPU 或把失败当作未命中。"
+            f"原因：{type(exc).__name__}: {exc}"
+        ) from exc
     clean = cleanup or (lambda text: "".join(normalized(text).casefold().split()))
     haystack = clean("".join(recognized))
     variants = {
@@ -1078,6 +1132,8 @@ def add_first_image_ocr_immediate_groups(
         requested_labels = requests[first_id]
         payload = payloads.get(first_id)
         first = messages_by_id[first_id]
+        if not payload:
+            raise OcrError(f"相邻组首图缺失：消息 {first_id}；无法完成 OCR，本次任务已中止")
         hits = ocr_labels_from_payload(
             payload,
             detected_labels if detected_labels is not None else requested_labels,
@@ -1085,7 +1141,7 @@ def add_first_image_ocr_immediate_groups(
             on_error=lambda error, m=first: log and log(
                 f"【识别】OCR失败：{media_group_description([m])}（{error}）"
             ),
-        ) if payload else set()
+        )
         candidate = candidate_groups[first_id]
         labels_to_add = hits if detected_labels is not None else requested_labels.intersection(hits)
         if detected_labels is not None:
@@ -1142,7 +1198,7 @@ def filter_unwanted_ocr_groups(
         for message in sorted(group, key=lambda item: item.id):
             payload = payloads.get(message.id)
             if not payload:
-                continue
+                raise OcrError(f"过滤所需图片缺失：消息 {message.id}；无法完成 OCR，本次任务已中止")
             hits = ocr_labels_from_payload(
                 payload,
                 markers,
@@ -2523,6 +2579,7 @@ class TelegramDownloaderApp:
                     groups = ordered_media_groups(media_messages)
                     preview_ids: set[int] = set()
                     first_image_preview_ids: set[int] = set()
+                    marker_preview_ids: set[int] = set()
                     if visual_adjacent_labels:
                         preview_ids.update(
                             collect_adjacent_preview_messages(
@@ -2541,8 +2598,15 @@ class TelegramDownloaderApp:
                         )
                         preview_ids.update(first_image_preview_ids)
                     if marker_filter_labels:
-                        preview_ids.update(
-                            collect_label_group_messages(media_messages, selection, marker_filter_labels)
+                        marker_preview_ids = collect_label_group_messages(media_messages, selection, marker_filter_labels)
+                        preview_ids.update(marker_preview_ids)
+                    ocr_engine = None
+                    if first_image_preview_ids or marker_preview_ids:
+                        self.set_progress(0, 0, "加载 GPU OCR 模型…")
+                        ocr_engine = get_ocr_engine()
+                        self.log(
+                            f"【识别】OCR 配置：GPU-only / {OCR_DEVICE} / FP32 / "
+                            f"{OCR_MODEL_DET} + {OCR_MODEL_REC}"
                         )
                     preview_messages = {
                         message.id: message for message in media_messages if message.id in preview_ids
@@ -2597,54 +2661,45 @@ class TelegramDownloaderApp:
                             log=self.log,
                         )
                     if first_image_ocr_labels and first_image_preview_ids:
-                        self.set_progress(0, 0, "加载 OCR 模型…")
-                        ocr_engine = get_ocr_engine()
-                        if ocr_engine is None:
-                            self.log(f"【识别】图片文字识别不可用：{ocr_engine_error_text()}")
-                        else:
-                            ocr_started = time.monotonic()
-                            first_ocr_total = len(first_image_preview_ids)
-                            self.set_progress(
-                                0, first_ocr_total,
-                                f"文字识别：0 / {first_ocr_total}",
+                        ocr_started = time.monotonic()
+                        first_ocr_total = len(first_image_preview_ids)
+                        self.set_progress(
+                            0, first_ocr_total,
+                            f"文字识别：0 / {first_ocr_total}",
+                            phase_started=ocr_started,
+                        )
+                        selection = add_first_image_ocr_immediate_groups(
+                            media_messages,
+                            selection,
+                            first_image_ocr_labels,
+                            preview_cache,
+                            ocr_engine=ocr_engine,
+                            bidirectional_labels=bidirectional_labels,
+                            detected_labels=first_image_detected_labels,
+                            log=self.log,
+                            on_progress=lambda done, total: self.set_progress(
+                                done, total, f"文字识别：{done} / {total}",
                                 phase_started=ocr_started,
-                            )
-                            selection = add_first_image_ocr_immediate_groups(
-                                media_messages,
-                                selection,
-                                first_image_ocr_labels,
-                                preview_cache,
-                                ocr_engine=ocr_engine,
-                                bidirectional_labels=bidirectional_labels,
-                                detected_labels=first_image_detected_labels,
-                                log=self.log,
-                                on_progress=lambda done, total: self.set_progress(
-                                    done, total, f"文字识别：{done} / {total}",
-                                    phase_started=ocr_started,
-                                ),
-                            )
-                    if marker_filter_labels:
+                            ),
+                        )
+                    if marker_filter_labels and marker_preview_ids:
                         self.set_progress(0, 0, "标题识别：检查不要组特征词…")
-                        marker_engine = get_ocr_engine()
-                        if marker_engine is None:
-                            self.log(f"【识别】图片文字识别不可用，未执行不要组过滤：{ocr_engine_error_text()}")
-                        else:
-                            marker_started = time.monotonic()
-                            selection, ignored_ids = filter_unwanted_ocr_groups(
-                                media_messages,
-                                selection,
-                                marker_filter_labels,
-                                preview_cache,
-                                XINAO_EXPERT_UNWANTED_MARKERS,
-                                ocr_engine=marker_engine,
-                                log=self.log,
-                                on_progress=lambda done, total: self.set_progress(
-                                    done, total, f"标题识别：{done} / {total}",
-                                    phase_started=marker_started,
-                                ),
-                            )
-                            for label, ids in ignored_ids.items():
-                                ignored_note_ids[label].update(ids)
+                        marker_started = time.monotonic()
+                        selection, ignored_ids = filter_unwanted_ocr_groups(
+                            media_messages,
+                            selection,
+                            marker_filter_labels,
+                            preview_cache,
+                            XINAO_EXPERT_UNWANTED_MARKERS,
+                            ocr_engine=ocr_engine,
+                            log=self.log,
+                            on_progress=lambda done, total: self.set_progress(
+                                done, total, f"标题识别：{done} / {total}",
+                                phase_started=marker_started,
+                            ),
+                        )
+                        for label, ids in ignored_ids.items():
+                            ignored_note_ids[label].update(ids)
                 matched_total = sum(message.id in selection for message in media_messages)
                 self.set_progress(
                     0,
@@ -3066,13 +3121,52 @@ def run_self_test() -> None:
 
 
 def run_ocr_self_test(output_file: Path) -> bool:
-    engine = get_ocr_engine()
     payload = {
-        "ok": engine is not None,
-        "error": "" if engine is not None else ocr_engine_error_text(),
+        "ok": False,
+        "configured_device": OCR_DEVICE,
+        "runtime_device": "",
+        "gpu_name": "",
+        "paddle_version": "",
+        "cuda_version": "",
+        "model_det": OCR_MODEL_DET,
+        "model_rec": OCR_MODEL_REC,
+        "inference_executed": False,
+        "smoke_keyword_matched": False,
+        "error": "",
     }
+    try:
+        import paddle
+
+        payload["paddle_version"] = str(getattr(paddle, "__version__", ""))
+        payload["cuda_version"] = str(paddle.version.cuda())
+        engine = get_ocr_engine()
+        payload["runtime_device"] = str(paddle.device.get_device())
+        payload["gpu_name"] = str(paddle.device.cuda.get_device_name(0))
+
+        from PIL import ImageDraw, ImageFont
+
+        font_candidates = [
+            Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arial.ttf",
+            Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "segoeui.ttf",
+        ]
+        font_path = next((path for path in font_candidates if path.is_file()), None)
+        if font_path is None:
+            raise RuntimeError("未找到可用的 Windows 测试字体")
+        image = Image.new("RGB", (960, 240), "white")
+        ImageDraw.Draw(image).text((40, 70), "GPU OCR 12345", fill="black", font=ImageFont.truetype(str(font_path), 64))
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        matched = ocr_labels_from_payload(output.getvalue(), {"12345"}, ocr_engine=engine)
+        payload["inference_executed"] = True
+        payload["smoke_keyword_matched"] = "12345" in matched
+        if not payload["smoke_keyword_matched"]:
+            raise RuntimeError("GPU OCR 自检未识别到测试关键词 12345")
+        payload["ok"] = True
+    except Exception as exc:
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return engine is not None
+    return bool(payload["ok"])
 
 
 def main() -> None:

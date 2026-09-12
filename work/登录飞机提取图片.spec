@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from importlib.util import find_spec
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata, collect_submodules
 
 
 paddlex_config_data = collect_data_files('paddlex', includes=['configs/**'])
 paddle_binaries = collect_dynamic_libs('paddle')
+if find_spec('nvidia') is not None:
+    paddle_binaries += collect_dynamic_libs('nvidia')
 ocr_dependency_metadata = []
 for package_name in (
+    'paddlepaddle-gpu',
+    'paddleocr',
+    'paddlex',
     'imagesize',
     'opencv-contrib-python',
     'pyclipper',
@@ -35,8 +41,6 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
     name='登录飞机提取图片',
     debug=False,
@@ -51,4 +55,15 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    exclude_binaries=True,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='登录飞机提取图片',
 )

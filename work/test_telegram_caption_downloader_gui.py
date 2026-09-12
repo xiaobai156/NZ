@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import sys
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -67,6 +68,8 @@ from telegram_caption_downloader_gui import (
     compact_text,
     collect_label_group_messages,
     filter_unwanted_ocr_groups,
+    OcrError,
+    get_ocr_engine,
 )
 
 
@@ -473,8 +476,47 @@ class CoreLogicTests(unittest.TestCase):
 
     def test_ocr_error_is_reported_without_dumping_image_or_exception_contents(self):
         events = []
-        self.assertEqual(ocr_labels_from_payload(b"bad image", {"战狼"}, object(), on_error=events.append), set())
+        with self.assertRaises(OcrError):
+            ocr_labels_from_payload(b"bad image", {"战狼"}, object(), on_error=events.append)
         self.assertEqual(events, ["UnidentifiedImageError"])
+
+    def test_gpu_ocr_engine_uses_v6_small_and_gpu0_fp32(self):
+        import types
+        import telegram_caption_downloader_gui as module
+
+        calls = []
+
+        class FakePaddleOCR:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        fake_paddle = types.SimpleNamespace(
+            __version__="3.2.2",
+            is_compiled_with_cuda=lambda: True,
+            set_device=lambda value: calls.append({"set_device": value}),
+            device=types.SimpleNamespace(
+                cuda=types.SimpleNamespace(device_count=lambda: 1),
+                get_device=lambda: "gpu:0",
+            ),
+        )
+        fake_paddleocr = types.SimpleNamespace(PaddleOCR=FakePaddleOCR)
+        previous_engine, previous_error = module._OCR_ENGINE, module._OCR_ENGINE_ERROR
+        module._OCR_ENGINE = None
+        module._OCR_ENGINE_ERROR = None
+        try:
+            with patch.dict(sys.modules, {"paddle": fake_paddle, "paddleocr": fake_paddleocr}):
+                engine = get_ocr_engine()
+            self.assertIsInstance(engine, FakePaddleOCR)
+            self.assertEqual(calls[0], {"set_device": "gpu:0"})
+            self.assertEqual(calls[1]["text_detection_model_name"], "PP-OCRv6_small_det")
+            self.assertEqual(calls[1]["text_recognition_model_name"], "PP-OCRv6_small_rec")
+            self.assertEqual(calls[1]["device"], "gpu:0")
+            self.assertEqual(calls[1]["precision"], "fp32")
+            self.assertFalse(calls[1]["enable_hpi"])
+            self.assertFalse(calls[1]["use_tensorrt"])
+            self.assertFalse(calls[1]["enable_mkldnn"])
+        finally:
+            module._OCR_ENGINE, module._OCR_ENGINE_ERROR = previous_engine, previous_error
 
     def test_unwanted_marker_matching_ignores_punctuation_and_spaces(self):
         class FakeOCR:
@@ -2235,7 +2277,7 @@ class GuiFlowTests(unittest.TestCase):
         ):
             self.app.start_download()
             self.root.update()
-            for phase in ("备注匹配", "预览下载", "图片比对", "加载 OCR", "文字识别", "正在处理", "保存结果"):
+            for phase in ("备注匹配", "预览下载", "图片比对", "加载 GPU OCR", "文字识别", "正在处理", "保存结果"):
                 self.assertTrue(any(status.startswith(phase) for _, _, status in progress_updates), phase)
             for phase in ("预览下载", "文字识别"):
                 self.assertTrue(any(current == total and total > 0 and status.startswith(phase)
@@ -2260,18 +2302,18 @@ class GuiFlowTests(unittest.TestCase):
             self.assertEqual(len(list(group_output.rglob("*.jpg"))), 1)
             from unittest.mock import AsyncMock
             with patch.object(Message, "download_media", new=AsyncMock(side_effect=OSError("test download failure"))):
-                self.app.start_download()
+                with self.assertRaises(OcrError):
+                    self.app.start_download()
             failed = load_capture_status(status_path)["remarks"]["战狼"]
-            self.assertEqual(failed["pending_message_ids"], [1])
-            self.assertEqual(failed["image_count"], 0)
-            self.assertEqual(failed["status"], "待复抓")
+            self.assertEqual(failed["pending_message_ids"], [3, 4])
+            self.assertEqual(failed["image_count"], 1)
+            self.assertEqual(failed["status"], "部分完成")
             preview_updates = [(current, total) for current, total, status in progress_updates
                                if status.startswith("预览下载")]
             self.assertGreater(preview_updates[-1][1], 0)
             self.assertEqual(*preview_updates[-1])
             self.root.update()
-            self.assertTrue(self.app.task_status.get().startswith("完成："))
-            self.assertIsNone(self.app._capture_timer)
+            self.assertFalse(self.app.task_status.get().startswith("完成："))
 
     def test_yanran_tianji_flow_ocr_reads_only_neighbor_first_images(self):
         root = Path(self.app_directory.name)
@@ -2499,7 +2541,7 @@ class GuiFlowTests(unittest.TestCase):
         self.assertIn("实力双波", logs)
         self.assertIn("整组 2 张忽略", logs)
 
-    def test_xinao_expert_keeps_all_groups_when_ocr_is_unavailable(self):
+    def test_xinao_expert_ocr_failure_aborts_without_writing_results(self):
         root = Path(self.app_directory.name)
         save_group_profile(self.app.program_root, self.app.settings, "", "新澳高手", "@expert")
         self.app.reload_group_profiles("新澳高手")
@@ -2557,13 +2599,11 @@ class GuiFlowTests(unittest.TestCase):
             patch("telegram_caption_downloader_gui.messagebox.showinfo"),
             patch("telegram_caption_downloader_gui.get_ocr_engine", return_value=None),
         ):
-            self.app.start_download()
+            with self.assertRaises(OcrError):
+                self.app.start_download()
         output = root / "results" / "9.2-新澳高手" / "斩杀系列"
-        self.assertEqual(len(list(output.glob("*.jpg"))), 4)
-        status = load_capture_status(capture_status_path(self.app.status_root, "新澳高手"))
-        self.assertEqual(status["remarks"]["斩杀系列"]["image_message_ids"], [1, 2, 3, 4])
-        logs = "\n".join(path.read_text(encoding="utf-8") for path in self.app.log_root.rglob("*.log"))
-        self.assertIn("未执行不要组过滤", logs)
+        self.assertFalse(output.exists())
+        self.assertFalse(capture_status_path(self.app.status_root, "新澳高手").exists())
 
     def test_huangdaxian_ocr_reads_each_neighbor_first_image_once_without_similarity(self):
         root = Path(self.app_directory.name)
